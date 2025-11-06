@@ -1,0 +1,2 @@
+# Employee-Performance-and-Compensation-Analytics-System
+This project is a Python-based Employee Management and Analytics System that uses MySQL for secure data storage. It enables role-based access, tracks employee performance and salary, and provides statistical insights through NumPy and Matplotlib. The system also generates automated reports and maintains a full change history for transparency.
