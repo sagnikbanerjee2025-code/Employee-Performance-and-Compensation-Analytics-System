@@ -10,8 +10,11 @@ Features:
  - Monthly report generator (CSV + charts) for any month
  - Passwords hashed with SHA256
  - Clean, well-documented single-file application
-"""
 
+Modifications:
+ - Users can now input emp_id manually when adding employees.
+ - Added a method to count employees in a particular department and a console option to show it.
+"""
 import mysql.connector
 import numpy as np
 import matplotlib.pyplot as plt
@@ -58,7 +61,7 @@ def safe_float(val, default=0.0):
 
 
 def ensure_non_empty_string(s, name="value"):
-    s = s.strip()
+    s = str(s).strip()
     if not s:
         raise ValueError(f"{name} cannot be empty.")
     return s
@@ -74,7 +77,8 @@ class DatabaseManager:
       - employees(emp_id, name, department, salary, performance_score, created_at)
       - users(user_id, username, password_hash, role, created_at)
       - employee_history(hist_id, emp_id, change_type, old_value, new_value, changed_at)
-5    """
+    Note: emp_id is now expected to be supplied by the user (PRIMARY KEY).
+    """
 
     def __init__(self, host="localhost", user="root", password="Welcome1!", database="company_db"):
         self.host = host
@@ -98,13 +102,14 @@ class DatabaseManager:
         conn.commit()
         conn.close()
 
-        # Create tables
+        # Create tables (employees with emp_id PRIMARY KEY - user-supplied)
         conn = self.connect()
         cur = conn.cursor()
 
+        # NOTE: If you already have an employees table with AUTO_INCREMENT, you'll need to migrate or drop it
         cur.execute("""
             CREATE TABLE IF NOT EXISTS employees (
-                emp_id INT AUTO_INCREMENT PRIMARY KEY,
+                emp_id INT PRIMARY KEY,
                 name VARCHAR(100),
                 department VARCHAR(50),
                 salary FLOAT,
@@ -193,15 +198,30 @@ class DatabaseManager:
         return None
 
     # Employee CRUD methods
-    def insert_employee(self, name, department, salary, performance_score):
+    def insert_employee(self, emp_id, name, department, salary, performance_score):
+        """
+        Insert an employee with user-supplied emp_id.
+        Returns the emp_id on success.
+        Raises a ValueError if emp_id already exists or on other DB errors.
+        """
         conn = self.connect()
         cur = conn.cursor()
-        cur.execute("INSERT INTO employees (name, department, salary, performance_score, created_at) VALUES (%s, %s, %s, %s, %s)",
-                    (name, department, salary, performance_score, datetime.now()))
-        conn.commit()
-        new_id = cur.lastrowid
-        conn.close()
-        return new_id
+        try:
+            cur.execute(
+                "INSERT INTO employees (emp_id, name, department, salary, performance_score, created_at) VALUES (%s, %s, %s, %s, %s, %s)",
+                (emp_id, name, department, salary, performance_score, datetime.now())
+            )
+            conn.commit()
+        except mysql.connector.Error as err:
+            conn.rollback()
+            # Duplicate primary key
+            if err.errno in (1062,):  # duplicate entry error code (MySQL)
+                raise ValueError(f"Employee ID {emp_id} already exists. Please pick a different ID.") from err
+            else:
+                raise
+        finally:
+            conn.close()
+        return emp_id
 
     def fetch_all_employees(self, department_filter: str = None):
         conn = self.connect()
@@ -323,12 +343,14 @@ class EmployeeManager:
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
 
-    def add_employee(self, name, department, salary, performance_score):
+    # Now expects emp_id provided by caller
+    def add_employee(self, emp_id, name, department, salary, performance_score):
         name = ensure_non_empty_string(name, "Name")
         department = ensure_non_empty_string(department, "Department")
         salary = safe_float(salary)
         performance_score = safe_float(performance_score)
-        new_id = self.db.insert_employee(name, department, salary, performance_score)
+        # Insert and return emp_id (or raise ValueError on duplicate)
+        new_id = self.db.insert_employee(emp_id, name, department, salary, performance_score)
         return new_id
 
     def list_employees(self, department_filter: str = None):
@@ -359,6 +381,12 @@ class EmployeeManager:
 
     def get_history(self, emp_id):
         return self.db.fetch_history_for_employee(emp_id)
+
+    # NEW: Count employees in a department
+    def count_by_department(self, department):
+        department = ensure_non_empty_string(department, "Department")
+        rows = self.db.fetch_all_employees(department)
+        return len(rows)
 
 
 # ============================
@@ -509,6 +537,128 @@ class AnalyticsEngine:
         filename = os.path.join(CHART_DIR, f"salary_vs_perf_{department_filter or 'all'}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
         fig.savefig(filename)
         plt.close(fig)
+        return filename
+
+    # --------------------
+    # New dashboard methods
+    # --------------------
+
+    def department_comparison_dashboard(self):
+        """
+        Compare average salary and average performance across all departments.
+        Saves a bar chart and prints department-wise averages.
+        """
+        employees = self.emp_manager.list_employees()
+        if not employees:
+            print("No employee data available.")
+            return None
+
+        dept_map = {}
+        for e in employees:
+            dept_map.setdefault(e.department, []).append(e)
+
+        dept_names = []
+        avg_salaries = []
+        avg_performances = []
+
+        for dept, emps in dept_map.items():
+            salaries = [emp.salary for emp in emps]
+            perfs = [emp.performance_score for emp in emps]
+            dept_names.append(dept)
+            avg_salaries.append(float(np.mean(salaries)))
+            avg_performances.append(float(np.mean(perfs)))
+
+        # Print summary to console
+        print("\n--- Department Comparison: Avg Salary vs Avg Performance ---")
+        for i, d in enumerate(dept_names):
+            print(f"{d}: Avg Salary = {avg_salaries[i]:.2f}, Avg Performance = {avg_performances[i]:.2f}")
+
+        # Plot: side-by-side bars
+        x = np.arange(len(dept_names))
+        width = 0.35
+        fig, ax = plt.subplots()
+        ax.bar(x - width/2, avg_salaries, width, label='Avg Salary')
+        ax.bar(x + width/2, avg_performances, width, label='Avg Performance')
+        ax.set_xticks(x)
+        ax.set_xticklabels(dept_names, rotation=45, ha='right')
+        ax.set_title("Department Comparison (Avg Salary vs Avg Performance)")
+        ax.legend()
+        plt.tight_layout()
+
+        filename = os.path.join(CHART_DIR, f"department_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+        fig.savefig(filename)
+        plt.close(fig)
+        print(f"Department comparison chart saved to: {filename}")
+        return filename
+
+    def employee_comparison_dashboard(self, emp_id: int):
+        """
+        For a given employee ID, compare that employee's salary & performance to
+        their department average and overall company average.
+        Saves a small comparison chart and prints the numbers.
+        """
+        emp = self.emp_manager.get_employee(emp_id)
+        if not emp:
+            print("Employee not found.")
+            return None
+
+        # gather department and company arrays
+        dept_emps = self.emp_manager.list_employees(emp.department)
+        all_emps = self.emp_manager.list_employees()
+
+        if not dept_emps or not all_emps:
+            print("Insufficient data for comparison (need at least one dept and company data).")
+            return None
+
+        dept_salaries = np.array([e.salary for e in dept_emps], dtype=float)
+        dept_perfs = np.array([e.performance_score for e in dept_emps], dtype=float)
+        all_salaries = np.array([e.salary for e in all_emps], dtype=float)
+        all_perfs = np.array([e.performance_score for e in all_emps], dtype=float)
+
+        dept_avg_salary = float(np.mean(dept_salaries))
+        dept_avg_perf = float(np.mean(dept_perfs))
+        all_avg_salary = float(np.mean(all_salaries))
+        all_avg_perf = float(np.mean(all_perfs))
+
+        # Print comparison
+        print(f"\n--- Employee Comparison for {emp.name} (ID {emp.emp_id}) ---")
+        print(f"Department: {emp.department}")
+        print(f"Employee Salary: {emp.salary:.2f} | Employee Performance: {emp.performance_score:.2f}")
+        print(f"Department Avg Salary: {dept_avg_salary:.2f} | Department Avg Perf: {dept_avg_perf:.2f}")
+        print(f"Overall Avg Salary: {all_avg_salary:.2f} | Overall Avg Perf: {all_avg_perf:.2f}")
+        # --- Percent Difference Calculations ---
+        dept_salary_diff = ((emp.salary - dept_avg_salary) / dept_avg_salary) * 100
+        dept_perf_diff = ((emp.performance_score - dept_avg_perf) / dept_avg_perf) * 100
+        overall_salary_diff = ((emp.salary - all_avg_salary) / all_avg_salary) * 100
+        overall_perf_diff = ((emp.performance_score - all_avg_perf) / all_avg_perf) * 100
+
+        print("\n--- Percent Difference ---")
+        print(f"Salary vs Dept Avg: {dept_salary_diff:+.2f}%")
+        print(f"Performance vs Dept Avg: {dept_perf_diff:+.2f}%")
+        print(f"Salary vs Overall Avg: {overall_salary_diff:+.2f}%")
+        print(f"Performance vs Overall Avg: {overall_perf_diff:+.2f}%")
+
+
+        # Build chart: Employee vs Dept Avg vs Overall Avg (two grouped bars)
+        labels = ["Employee", "Dept Avg", "Overall Avg"]
+        salaries = [emp.salary, dept_avg_salary, all_avg_salary]
+        performances = [emp.performance_score, dept_avg_perf, all_avg_perf]
+
+        x = np.arange(len(labels))
+        width = 0.35
+        fig, ax = plt.subplots()
+        ax.bar(x - width/2, salaries, width, label='Salary')
+        ax.bar(x + width/2, performances, width, label='Performance')
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels)
+        ax.set_title(f"{emp.name} - Salary & Performance Comparison")
+        ax.legend()
+        plt.tight_layout()
+
+        filename = os.path.join(CHART_DIR, f"employee_comparison_{emp.emp_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+        fig.savefig(filename)
+        plt.close(fig)
+        print(f"Employee comparison chart saved to: {filename}")
         return filename
 
 
@@ -755,12 +905,17 @@ class ConsoleApp:
     # ---------- Employee flows ----------
     def _add_employee_flow(self):
         try:
+            # <-- NEW: user supplies emp_id here -->
+            emp_id_str = input("Employee ID (integer): ").strip()
+            emp_id = int(emp_id_str)
             name = input("Name: ").strip()
             department = input("Department: ").strip()
             salary = input("Salary: ").strip()
             perf = input("Performance score (1-10): ").strip()
-            emp_id = self.emp_mgr.add_employee(name, department, salary, perf)
-            print(f"Employee added with ID {emp_id}.")
+            new_id = self.emp_mgr.add_employee(emp_id, name, department, salary, perf)
+            print(f"Employee added with ID {new_id}.")
+        except ValueError as ve:
+            print(f"Failed to add employee: {ve}")
         except Exception as e:
             print(f"Failed to add employee: {e}")
 
@@ -786,6 +941,17 @@ class ConsoleApp:
                     print("History (most recent first):")
                     for h in history:
                         print(f"{h[4]} | {h[1]} | from '{h[2]}' to '{h[3]}'")
+
+            # <-- NEW: ask if user wants to count employees in a department -->
+            count_choice = input("Would you like to count employees in a department? (y/N): ").strip().lower()
+            if count_choice == "y":
+                dept_to_count = input("Enter department name: ").strip()
+                try:
+                    cnt = self.emp_mgr.count_by_department(dept_to_count)
+                    print(f"Number of employees in '{dept_to_count}': {cnt}")
+                except Exception as e:
+                    print(f"Error counting department employees: {e}")
+
         except Exception as e:
             print(f"Error viewing employees: {e}")
 
@@ -840,6 +1006,8 @@ class ConsoleApp:
             print("4. Fit regression model (Salary = m*Perf + c)")
             print("5. Predict salary from performance score")
             print("6. Generate and save charts (histograms, scatter)")
+            print("7. Department Comparison Dashboard (Avg salary vs Avg performance)")
+            print("8. Employee Comparison Dashboard (employee vs dept & overall)")
             print("0. Back to main")
             choice = input("Choose option: ").strip()
             try:
@@ -883,6 +1051,16 @@ class ConsoleApp:
                     for f in (sfile, pfile, spfile):
                         if f:
                             print(f"  {f}")
+                elif choice == "7":
+                    # Department comparison: avg salary vs avg performance across departments
+                    self.analytics.department_comparison_dashboard()
+                elif choice == "8":
+                    # Employee comparison: employee vs dept and overall
+                    try:
+                        emp_id = int(input("Enter employee ID: ").strip())
+                        self.analytics.employee_comparison_dashboard(emp_id)
+                    except ValueError:
+                        print("Invalid employee ID.")
                 elif choice == "0":
                     break
                 else:
